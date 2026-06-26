@@ -1,6 +1,6 @@
 [project]
 name = "ComfyUI-Conditioning-Rebalance"
-description = "AConditioning optimizer nodes with per layer weighting that offers IP-Adapter-like features for Krea 2 image reference editing along with bypassing the built in quality diluation from the trained safety filter and also works as a means to unfilter the model."
+description = "Conditioning optimizer nodes with per layer weighting that offers IP-Adapter-like features for Krea 2 image reference editing along with bypassing the built in quality diluation from the trained safety filter and also works as a means to unfilter the model."
 version = "1.0.1"
 license = "MIT" 
 # classifiers = [
