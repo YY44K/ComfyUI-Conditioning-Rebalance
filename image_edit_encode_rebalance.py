@@ -75,47 +75,47 @@ SYS_TEMPLATE = (
 )
 
 
-def compile_edit(clip, vae, prompt, image, strength=1.0):
+# Target longest-side resolution per tier. Each image is scaled to it selected resolution independently
+RESOLUTIONS = {"low": 256, "normal": 512, "high": 1024, "max": 1280}
+
+
+def _scale_to_resolution(samples, target):
+
+    n, c, h, w = samples.shape
+    if h == target and w == target:
+        return samples
+    scale = target / max(h, w)
+    nh = max(1, round(h * scale))
+    nw = max(1, round(w * scale))
+    return comfy.utils.common_upscale(samples, nw, nh, "area", "disabled")
+
+
+def compile_edit(clip, prompt, images_with_size=None):
+    """Encode an edit prompt with optional reference images."""
     if not _COMFY_AVAILABLE:
         raise RuntimeError("Krea 2 Edit requires ComfyUI (comfy.utils, node_helpers).")
 
-    images_vl = None
-    combined_latents = None
-    if image is not None:
-        samples = image.movedim(-1, 1)  # NHWC -> NCHW
+    images_vl = []
+    image_prompt = ""
 
-        PIXEL_B = 1_843_200
-        src_pixels = samples.shape[3] * samples.shape[2]
-        if src_pixels > PIXEL_B:
-            scale_by = math.sqrt(PIXEL_B / src_pixels)
-            width = round(samples.shape[3] * scale_by)
-            height = round(samples.shape[2] * scale_by)
-            s = comfy.utils.common_upscale(samples, width, height, "area", "disabled")
-        else:
-            s = samples
-        images_vl = [s.movedim(1, -1)]  # back to NHWC for clip.tokenize
+    if images_with_size:
+        for i, (image, tier) in enumerate(images_with_size):
+            if image is None:
+                continue
+            target = RESOLUTIONS.get(tier, 256)
+            samples = image.movedim(-1, 1)  # NHWC -> NCHW
+            scaled = _scale_to_resolution(samples, target)
+            images_vl.append(scaled.movedim(1, -1))  # back to NHWC for clip.tokenize
+            image_prompt += "Picture {}: <|vision_start|><|image_pad|><|vision_end|>".format(i + 1)
 
-        latent = vae.encode(samples.movedim(1, -1)[:, :, :, :3])
-        combined_latents = [latent * strength]
-
-        image_prompt = "Picture 1: <|vision_start|><|image_pad|><|vision_end|>"
-        full_prompt = image_prompt + prompt
-    else:
-        full_prompt = prompt
+    full_prompt = image_prompt + prompt if image_prompt else prompt
 
     tokens = clip.tokenize(
         full_prompt,
-        images=images_vl,
+        images=images_vl if images_vl else None,
         llama_template=SYS_TEMPLATE,
     )
     conditioning = clip.encode_from_tokens_scheduled(tokens)
-
-    if combined_latents is not None:
-        conditioning = node_helpers.conditioning_set_values(
-            conditioning,
-            {"reference_latents": combined_latents},
-            append=True,
-        )
 
     return conditioning
 
@@ -242,10 +242,19 @@ class Krea2EditRebalance:
         return {"required": {
             "text": ("STRING", {"multiline": True, "dynamicPrompts": True}),
             "clip": ("CLIP",),
-            "vae": ("VAE",),
+            "refocus_strength": ("FLOAT", {"default": 0.80, "min": 0.0, "max": 1000.0, "step": 0.01}),
+            "guidance_strength": ("FLOAT", {"default": 0.500, "min": 0.0, "max": 2.0, "step": 0.01}),
+            "enable_split": ("BOOLEAN", {"default": True}),
         },
         "optional": {
-            "image": ("IMAGE",),
+            "image1": ("IMAGE",),
+            "image1_tokens": (["low", "normal", "high", "max"], {"default": "normal"}),
+            "image2": ("IMAGE",),
+            "image2_tokens": (["low", "normal", "high", "max"], {"default": "normal"}),
+            "image3": ("IMAGE",),
+            "image3_tokens": (["low", "normal", "high", "max"], {"default": "normal"}),
+            "image4": ("IMAGE",),
+            "image4_tokens": (["low", "normal", "high", "max"], {"default": "normal"}),
         }}
 
     RETURN_TYPES = ("CONDITIONING",)
@@ -254,44 +263,170 @@ class Krea2EditRebalance:
     CATEGORY = "conditioning"
 
     @staticmethod
-    def _process_cond(cond):
+    def _process_cond(cond, refocus_strength=1.00, guidance_strength=0.500):
         cond_ref = refocus(
-            cond, 4.00, "1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0",
+            cond, refocus_strength, "1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0",
         )
         cond_main = refocus(
-            cond, 4.00, "0.0,1.0,0.0,0.0,0.0,0.0,0.0,1.0,9.0,1.0,1.0,1.0",
+            cond, refocus_strength, "0.0,1.0,0.0,0.0,0.0,0.0,0.0,1.0,9.0,1.0,1.0,1.0",
         )
-        return guidance(cond_main, cond_ref, 0.500)
+        return guidance(cond_main, cond_ref, guidance_strength)
 
-    def main(self, text, clip, vae, image=None):
+    def main(self, text, clip, refocus_strength=0.80, guidance_strength=0.500, enable_split=True,
+             image1=None, image1_tokens="normal",
+             image2=None, image2_tokens="normal",
+             image3=None, image3_tokens="normal",
+             image4=None, image4_tokens="normal"):
         if not _COMFY_AVAILABLE:
             raise RuntimeError("Krea 2 Edit requires ComfyUI (comfy.utils, node_helpers).")
 
         prompt = "(Subject:2) {}".format(text)
 
-        cond_text = compile_edit(clip, vae, prompt, None, 1.0)
-        cond_text = self._process_cond(cond_text)
-        cond_text = node_helpers.conditioning_set_values(
-            cond_text, {"start_percent": 0.000, "end_percent": 0.175},
-        )
+        images_with_size = [
+            (image1, image1_tokens),
+            (image2, image2_tokens),
+            (image3, image3_tokens),
+            (image4, image4_tokens),
+        ]
+        has_image = any(img is not None for img, _ in images_with_size)
 
-        cond_image = compile_edit(clip, vae, prompt, image, 1.0)
-        cond_image = self._process_cond(cond_image)
-        cond_image = node_helpers.conditioning_set_values(
-            cond_image, {"start_percent": 0.175, "end_percent": 1.000},
-        )
+        if enable_split:
+            cond_text = compile_edit(clip, prompt, None)
+            cond_text = self._process_cond(cond_text, refocus_strength, guidance_strength)
+            cond_text = node_helpers.conditioning_set_values(
+                 cond_text, {"start_percent": 0.000, "end_percent": 0.175},
+            )
 
-        final = cond_text + cond_image
+            if has_image:
+                cond_image = compile_edit(clip, prompt, images_with_size)
+                cond_image = self._process_cond(cond_image, refocus_strength, guidance_strength)
+                cond_image = node_helpers.conditioning_set_values(
+                     cond_image, {"start_percent": 0.175, "end_percent": 1.000},
+                )
+                final = cond_image + cond_text
+            else:
+                final = cond_text
+        else:
+            if has_image:
+                final = compile_edit(clip, prompt, images_with_size)
+            else:
+                final = compile_edit(clip, prompt, None)
+            final = self._process_cond(final, refocus_strength, guidance_strength)
+            final = node_helpers.conditioning_set_values(
+                final, {"start_percent": 0.000, "end_percent": 1.000},
+            )
+
+        return (final,)
+
+
+class Krea2EditRebalanceC:
+    """Advanced variant of Krea2EditRebalance."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "text": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+            "clip": ("CLIP",),
+            "positive_strength": ("FLOAT", {"default": 1.00, "min": 0.0, "max": 1000.0, "step": 0.01}),
+            "negative_strength": ("FLOAT", {"default": 1.00, "min": 0.0, "max": 1000.0, "step": 0.01}),
+            "positive_layers": ("STRING", {"default": "1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0", "multiline": False}),
+            "negative_layers": ("STRING", {"default": "1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0", "multiline": False}),
+            "guidance_strength": ("FLOAT", {"default": 0.500, "min": 0.0, "max": 2.0, "step": 0.01}),
+            "enable_step": ("FLOAT", {"default": 0.000, "min": 0.000, "max": 1.000, "step": 0.001}),
+            "enable_split": ("BOOLEAN", {"default": True}),
+        },
+        "optional": {
+            "image1": ("IMAGE",),
+            "image1_tokens": (["low", "normal", "high", "max"], {"default": "normal"}),
+            "image2": ("IMAGE",),
+            "image2_tokens": (["low", "normal", "high", "max"], {"default": "normal"}),
+            "image3": ("IMAGE",),
+            "image3_tokens": (["low", "normal", "high", "max"], {"default": "normal"}),
+            "image4": ("IMAGE",),
+            "image4_tokens": (["low", "normal", "high", "max"], {"default": "normal"}),
+        }}
+
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "main"
+    CATEGORY = "conditioning"
+
+    @staticmethod
+    def _process_cond(cond, positive_strength, negative_strength,
+                      positive_layers, negative_layers, guidance_strength):
+        cond_negative = refocus(cond, negative_strength, negative_layers)
+        cond_positive = refocus(cond, positive_strength, positive_layers)
+        return guidance(cond_positive, cond_negative, guidance_strength)
+
+    def main(self, text, clip, positive_strength=1.00, negative_strength=1.00,
+             positive_layers="1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0",
+             negative_layers="1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0",
+             guidance_strength=0.500, enable_step=0.000, enable_split=True,
+             image1=None, image1_tokens="normal",
+             image2=None, image2_tokens="normal",
+             image3=None, image3_tokens="normal",
+             image4=None, image4_tokens="normal"):
+        if not _COMFY_AVAILABLE:
+            raise RuntimeError("Krea 2 Edit requires ComfyUI (comfy.utils, node_helpers).")
+
+        prompt = "(Subject:2) {}".format(text)
+
+        images_with_size = [
+            (image1, image1_tokens),
+            (image2, image2_tokens),
+            (image3, image3_tokens),
+            (image4, image4_tokens),
+        ]
+        has_image = any(img is not None for img, _ in images_with_size)
+
+        step = float(enable_step)
+
+        if enable_split:
+            cond_text = compile_edit(clip, prompt, None)
+            cond_text = self._process_cond(
+                cond_text, positive_strength, negative_strength,
+                positive_layers, negative_layers, guidance_strength,
+            )
+            cond_text = node_helpers.conditioning_set_values(
+                cond_text, {"start_percent": 0.000, "end_percent": step},
+            )
+
+            if has_image:
+                cond_image = compile_edit(clip, prompt, images_with_size)
+                cond_image = self._process_cond(
+                    cond_image, positive_strength, negative_strength,
+                    positive_layers, negative_layers, guidance_strength,
+                )
+                cond_image = node_helpers.conditioning_set_values(
+                    cond_image, {"start_percent": step, "end_percent": 1.000},
+                )
+                final = cond_image + cond_text
+            else:
+                final = cond_text
+        else:
+            if has_image:
+                final = compile_edit(clip, prompt, images_with_size)
+            else:
+                final = compile_edit(clip, prompt, None)
+            final = self._process_cond(
+                final, positive_strength, negative_strength,
+                positive_layers, negative_layers, guidance_strength,
+            )
+            final = node_helpers.conditioning_set_values(
+                final, {"start_percent": 0.000, "end_percent": 1.000},
+            )
 
         return (final,)
 
 
 NODE_CLASS_MAPPINGS = {
     "Krea2EditRebalance": Krea2EditRebalance,
+    "Krea2EditRebalanceC": Krea2EditRebalanceC,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Krea2EditRebalance": "Krea 2 Image Edit Rebalance",
+    "Krea2EditRebalanceC": "Krea 2 Image Edit Rebalance C.",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
