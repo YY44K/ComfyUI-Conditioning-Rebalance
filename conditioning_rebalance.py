@@ -2,26 +2,46 @@ import torch
 
 
 def _scale_cond_tensor(t: torch.Tensor, multiplier, per_layer_weights=None):
-    """Scale a conditioning tensor, optionally with per-layer weighting.
+    """Scale a conditioning tensor, optionally with per-layer rebalancing.
 
-    Krea2 conditioning arrives as (B, seq, 12*2560) — the 12 Qwen3-VL taps flattened
-    into the feature dim.  When per_layer_weights is given we reshape to
-    (B, seq, 12, D), apply a different gain to each tap and flatten back.
+    If per_layer_weights is given, rebalance the 12 flattened Qwen taps while
+    preserving the original overall RMS magnitude. The global multiplier is
+    applied afterward.
     """
     if per_layer_weights is None:
         return t * multiplier
 
     flat = t.shape[-1]
     n_layers = len(per_layer_weights)
+
     if n_layers > 1 and flat % n_layers == 0:
         layer_dim = flat // n_layers
         orig_dtype = t.dtype
-        t = t.float()
-        t = t.view(*t.shape[:-1], n_layers, layer_dim)
-        gains = torch.tensor(per_layer_weights, dtype=t.dtype, device=t.device)
-        t = t * gains.view(*([1] * (t.dim() - 2)), n_layers, 1)
-        t = t.view(*t.shape[:-2], flat)
-        return t.to(orig_dtype) * multiplier
+
+        # Work in float32 for stable RMS math.
+        x = t.float()
+
+        # Save original overall conditioning magnitude.
+        orig_rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt()
+
+        # Reshape flattened layer stack:
+        # (B, seq, 12 * D) -> (B, seq, 12, D)
+        x = x.reshape(*x.shape[:-1], n_layers, layer_dim)
+
+        gains = torch.tensor(per_layer_weights, dtype=x.dtype, device=x.device)
+        x = x * gains.view(*([1] * (x.dim() - 2)), n_layers, 1)
+
+        # Flatten back:
+        # (B, seq, 12, D) -> (B, seq, 12 * D)
+        x = x.reshape(*x.shape[:-2], flat)
+
+        # Restore original overall magnitude after changing relative layer balance.
+        new_rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt()
+        x = x * (orig_rms / new_rms.clamp_min(1e-6))
+
+        # Apply global strength last.
+        return x.to(orig_dtype) * multiplier
+
     return t * multiplier
 
 
